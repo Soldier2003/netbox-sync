@@ -2190,13 +2190,44 @@ class VMWareHandler(SourceBase):
         platform = get_string_or_none(grab(obj, "config.guestFullName"))
         platform = get_string_or_none(grab(obj, "guest.guestFullName", fallback=platform))
 
+        # PORTED FROM UPSTREAM v1.8.1 (fixes bb-Ricardo/netbox-sync#448, #492, #495
+        # "wrong platform evaluation"): the previous version here only read
+        # 'guestOS.detailed.data', which can report a stale/configured OS string
+        # instead of what VMware Tools actually detects at runtime (e.g. a VM
+        # upgraded from RHEL 7 to RHEL 8 kept showing "Red Hat Enterprise Linux 7").
+        # 'guestInfo.detailed.data' (live guest-tools data) is now preferred, with
+        # 'guestOS.detailed.data' as fallback, and the resulting platform string
+        # gets suffixed with the distro version for Linux guests when available.
         # extract prettyName from extraConfig exposed by guest tools
-        extra_config = [x.value for x in grab(obj, "config.extraConfig", fallback=[])
-                        if x.key == "guestOS.detailed.data"]
-        if len(extra_config) > 0:
-            pretty_name = [x for x in quoted_split(extra_config[0].replace("' ", "', ")) if x.startswith("prettyName")]
-            if len(pretty_name) > 0:
-                platform = pretty_name[0].replace("prettyName='","")
+        extra_config = {x.key: x.value for x in grab(obj, "config.extraConfig", fallback=[])
+                        if x.key in ["guestOS.detailed.data", "guestInfo.detailed.data"]}
+
+        # first try 'guestInfo.detailed.data' and then 'guestOS.detailed.data'
+        detailed_data = extra_config.get("guestInfo.detailed.data") or extra_config.get("guestOS.detailed.data")
+
+        # if guestOS tools ar installed but are not able to determine the os-release
+        # then check against this pattern to guess if a correct os string has been returned
+        invalid_patterns = ["Usage:", "Error:", "command not found", "No such file"]
+
+        if isinstance(detailed_data, str):
+            detailed_data_dict = dict()
+            pretty_name = None
+            for detailed_data_item in quoted_split(detailed_data.replace("' ", "', ")):
+                if "=" not in detailed_data_item:
+                    continue
+
+                detailed_data_key, detailed_data_value = detailed_data_item.split("=")
+                detailed_data_dict[detailed_data_key] = detailed_data_value.strip("'")
+            if len(detailed_data_dict.get("prettyName", "")) > 0:
+                pretty_name = detailed_data_dict.get("prettyName")
+
+            if pretty_name and not any(pretty_name.startswith(p) for p in invalid_patterns):
+                platform = pretty_name
+                distro_version = detailed_data_dict.get("distroVersion")
+                if detailed_data_dict.get("familyName", "").lower() == "linux" and \
+                        distro_version is not None and \
+                        distro_version not in platform:
+                    platform = f'{platform} {distro_version}'
 
         if platform is not None:
             platform = self.get_object_relation(platform, "vm_platform_relation", fallback=platform)
