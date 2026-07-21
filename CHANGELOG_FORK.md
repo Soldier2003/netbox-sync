@@ -1,0 +1,184 @@
+# CHANGELOG_FORK.md
+
+Форк `bb-Ricardo/netbox-sync` для инфраструктуры Lense (netbox.seclab.local + vCenter_DEMO).
+
+Базовая версия: локально установленный **v1.8.0** (2025-03-07), точечно доведённый
+до состояния **v1.8.1** (2026-03-18) там, где это подтверждено проверкой исходников,
+плюс 3 собственных фикса, найденных при разборе `netbox-sync-logs` (18–20.07.2026).
+
+Все находки в этом документе основаны на:
+- фактическом коде `opt/netbox-sync/module/` из проекта (version 1.8.0);
+- фактических логах `netbox-sync-logs/*.log` (18–20.07.2026);
+- сравнении с исходниками upstream на тегах `v1.8.0` и `v1.8.1`
+  (github.com/bb-Ricardo/netbox-sync), полученными напрямую из репозитория;
+- официальными issue/PR/release notes GitHub (ссылки указаны у каждого пункта).
+
+---
+
+## 1. Перенесено из официального upstream v1.8.1
+
+netbox-sync **не заброшен полностью**: несмотря на issue о сворачивании поддержки
+([#474](https://github.com/bb-Ricardo/netbox-sync/issues/474), открыт 23.07.2025,
+срок архивации был обозначен 31.10.2025), 18.03.2026 вышел ещё один официальный
+релиз — **v1.8.1**. Это на 5 месяцев позже "дедлайна архивации" — то есть автор
+по факту продолжает изредка мержить фиксы. Из него перенесены 4 точечных
+изменения (только то, что реально проверено построчным сравнением, не весь релиз
+целиком — remaining упомянуто в разделе 3):
+
+| Файл | Что изменено | Зачем |
+|---|---|---|
+| `module/__init__.py` | версия `1.8.0` → `1.8.1-lense.1` | трассируемость версии в логах |
+| `requirements.txt` | `aiodns` `3.0.0` → `4.0.0`, остальные зависимости подтянуты к пинам v1.8.1 | **критично**: `aiodns==3.0.0` даёт `TypeError: Channel.gethostbyaddr() takes 2 positional arguments but 3 were given` под Python 3.12 (т.е. после перехода на Ubuntu 24.04, что в вашем плане апгрейда). Официально исправлено в v1.8.1 — issue [#488](https://github.com/bb-Ricardo/netbox-sync/issues/488) |
+| `netbox-sync.py` | добавлен блок "disable pruning if an enabled source is unavailable" | **важно для вас**: в логах зафиксировано 19 обрывов связи с vCenter ("No route to host"). Без этого фикса кратковременная недоступность vCenter могла привести к тому, что netbox-sync посчитает все объекты источника пропавшими и **удалит** их (prune). Фикс автоматически отключает prune на прогонах, где источник недоступен. Issue [#490](https://github.com/bb-Ricardo/netbox-sync/pull/490) |
+| `module/netbox/connection.py` → `get_api_version()` | теперь версия NetBox сначала читается из JSON `/api/status/` (`netbox-version`), и только потом — из HTTP-заголовка `API-Version` | исправляет "Missing API-Version" — часть NetBox-инсталляций/прокси не отдают кастомный заголовок. Issue [#446](https://github.com/bb-Ricardo/netbox-sync/issues/446) |
+
+**Не перенесено** (см. раздел 3): fix для "wrong platform evaluation" (#448, #492,
+#495), поддержка check_redfish 2.0 (#478, у вас источник check_redfish не
+используется — в `settings.yaml` включён только `vCenter_DEMO`), фикс конфликта
+зависимостей с `vsphere-automation-sdk` (#481, #497 — у вас VMware tag sync через
+этот SDK, судя по `settings.yaml`, не настроен).
+
+---
+
+## 2. Собственные фиксы (найдены в ваших логах, отсутствуют в upstream v1.8.1)
+
+Все три проверены построчно и против исходников v1.8.1 — баг присутствует
+**и там**, то есть это не "уже исправлено выше по течению", а реальный gap в
+самом проекте.
+
+### 2.1. MAC-адрес не отвязывается от интерфейса (~76 ошибок за прогон)
+
+**Файл:** `module/netbox/object_classes.py`, класс `NBMACAddress.remove_interface_association()`
+
+**Симптом в логах** (пример, `netbox-sync-20260719-0030.log:166-181`):
+```
+ERROR: NetBox returned: PATCH /api/dcim/mac-addresses/1418/ Bad Request
+ERROR: NetBox returned body: {'__all__': ['Cannot unassign MAC Address while it is designated as the primary MAC for an object']}
+```
+
+**Причина:** в NetBox 4.2+ поле `primary_mac_address` принадлежит **интерфейсу**
+(`NBInterface`/`NBVMInterface`), а не устройству/ВМ — в отличие от `primary_ip4`/
+`primary_ip6`, которые действительно являются полями устройства. Метод
+`remove_interface_association()` скопирован по образцу IP-адресного аналога и
+проверяет `primary_mac_address` на **устройстве** (`get_device_vm()`), у
+которого такого поля просто нет ни в `NBDevice`, ни в `NBVM.data_model`. В
+результате условие никогда не срабатывает, `primary_mac_address` на интерфейсе
+не очищается, и последующая попытка отвязать MAC от интерфейса отклоняется
+NetBox — потому что он **действительно всё ещё** назначен как primary.
+
+Отдельно от этого в самом NetBox была смежная, но другая ошибка —
+false-positive той же проверки даже для НЕ primary MAC — issue
+[#18768](https://github.com/netbox-community/netbox/issues/18768), исправлена
+в PR [#18784](https://github.com/netbox-community/netbox/pull/18784). Проверьте
+после апгрейда, не остались ли ошибки — если да, это будет означать, что ваша
+версия NetBox 4.6.x ещё не содержит этот PR.
+
+**Фикс:** проверять и очищать `primary_mac_address` на объекте, возвращаемом
+`get_interface()`, а не `get_device_vm()`.
+
+### 2.2. Дублирующийся asset_tag "Base Board Asset Tag" (~38 ошибок за прогон)
+
+**Файл:** `module/sources/vmware/connection.py`, сбор `AssetTag` для ESXi-хоста
+
+**Симптом в логах:**
+```
+ERROR: NetBox returned body: {'asset_tag': ['device with this asset tag already exists.']}
+```
+
+**Причина:** несколько ESXi-хостов (в логах — как минимум esxi05, esxi06)
+отдают через `otherIdentifyingInfo` **одинаковую** строку `"Base Board Asset
+Tag"` — это стандартное значение по умолчанию, которое AMI/Supermicro
+прошивка кладёт в SMBIOS Type 2 (Base Board Information), если в BIOS никто не
+вписал реальный asset tag вручную. Список `banned_tags` в коде уже отфильтровывает
+похожие плейсхолдеры ("Default string", "to be filled by o.e.m." и т.п.), но
+конкретно эту строку — нет. NetBox требует глобальной уникальности `asset_tag`,
+поэтому второй и последующие хосты с этим значением стабильно отклоняются.
+
+**Фикс:** добавлены `"Base Board Asset Tag"`, `"Chassis Asset Tag"` (тот же
+паттерн для SMBIOS Type 3), `"Asset Tag"`, `"Not Specified"`, `"Not Set"`,
+`"Fill By OEM"` в `banned_tags`; сравнение сделано по `.strip()`, чтобы пустая
+строка/пробелы тоже не считались валидным тегом.
+
+**Что стоит сделать отдельно:** это фильтрует значение **на будущее**. Если в
+NetBox уже записан `asset_tag = "Base Board Asset Tag"` на каком-то устройстве
+из прошлых прогонов, стоит один раз вручную очистить это поле в UI/API у
+затронутых устройств (в логах видно `esxi05.seclab.local`, `esxi06.seclab.local`,
+device id 409 и 411) — иначе они просто перестанут обновляться, но старое
+неверное значение останется.
+
+### 2.3. "Virtual interfaces cannot have a cable attached" (~93 ошибки за прогон)
+
+**Затронутые интерфейсы (device dcim/interfaces id, из логов):**
+4483, 4490, 4491, 4492, 4494, 4496, 4497 (vmk0/vmk3/vmk4 на нескольких хостах).
+
+**Причина:** netbox-sync вообще не читает и не пишет поле `cable` — это
+подтверждено (`grep -i cable` по всему `module/` не находит ни одного
+обращения ни в вашей установленной версии, ни в исходниках v1.8.1 с GitHub).
+Значит ошибка возникает только потому, что в самом NetBox на этих интерфейсах
+**уже стоит кабель** (создан вручную или остался от какой-то более старой
+интеграции/ошибки), а netbox-sync корректно синхронизирует их как
+`type: virtual` (VMkernel-порты — логические, не физические) — а NetBox
+запрещает физическое подключение кабеля к неподключаемому (`non-connectable`)
+типу интерфейса.
+
+**Фикс (добавлен в `module/netbox/connection.py`):** сделан "самолечащийся"
+retry — при получении именно этой ошибки на PATCH интерфейса netbox-sync:
+1. запрашивает текущий объект интерфейса, чтобы узнать `cable.id`;
+2. удаляет этот кабель через `DELETE /api/dcim/cables/{id}/`;
+3. повторяет исходный PATCH один раз.
+
+Если что-то в этой цепочке пойдёт не так — логируется предупреждение, и
+поведение откатывается к прежнему (ошибка просто логируется, прогон
+продолжается, как раньше). Кабель не пытается быть восстановлен — если он
+был нужен, то это укажет на то, что интерфейс в vCenter в реальности не
+"virtual", и тогда проблему нужно разбирать на уровне классификации
+типа интерфейса, а не на уровне кабеля.
+
+**Рекомендация:** это устраняет симптом автоматически, но стоит один раз
+проверить в NetBox UI, откуда вообще взялись эти кабели на vmk-портах —
+похоже на историческую ошибку ручного ввода или более раннюю версию скрипта.
+
+---
+
+## 3. Проверка совместимости с NetBox 4.3 → 4.6 (для апгрейда 4.2.6 → 4.6.4)
+
+Проверено построчным grep по всему `module/` на предмет использования
+конкретных breaking changes из release notes NetBox 4.3–4.6:
+
+| Breaking change NetBox | Затрагивает netbox-sync? | Проверка |
+|---|---|---|
+| GraphQL: новый синтаксис фильтров (4.3), id/enum lookup (4.5) | Нет | `grep -ri graphql module/` — 0 совпадений, используется только REST (`requests`) |
+| PostgreSQL 13 не поддерживается (4.3) | Нет | требование к серверу NetBox, не к netbox-sync |
+| django-storages обязателен (4.3) | Нет | зависимость NetBox-сервера |
+| `ALLOW_TOKEN_RETRIEVAL=False` по умолчанию (4.3) | Нет | netbox-sync только использует токен в заголовке `Authorization`, не обращается к `/api/users/tokens/` |
+| `/api/extras/object-types/` → `/api/core/object-types/`, старый эндпоинт удалён (4.5) | Нет | netbox-sync не обращается к этому эндпоинту вообще; поле `object_types`/`content_types` на custom fields уже обрабатывается через version-gate `>= 4.0.0` (`object_classes.py:1308-1345`) |
+| Python 3.12+ обязателен (4.5) | Да, но уже закрыто | решается переходом на Ubuntu 24.04 (по вашему плану) + `aiodns==4.0.0` (см. раздел 1) |
+| Токены v2 (v1 всё ещё работает, deprecated) (4.5) | Нет действий не требуется | заголовок `Token <value>` формата не меняет, обратная совместимость заявлена NetBox |
+| `/api/dcim/cable-terminations/` стал read-only (4.5) | Нет | это отдельный эндпоинт от `/api/dcim/cables/`, который остаётся полностью доступным для записи; наш фикс кабеля (2.3) использует именно `dcim/cables`, не `cable-terminations` |
+| `render_config` требует отдельного права (4.5) | Нет | netbox-sync не рендерит конфиги устройств |
+| PostgreSQL 14 / Redis 5.x deprecated, удаление в 4.7 (4.6) | Нет | требование к серверу NetBox, не к netbox-sync; учтено в общем плане апгрейда |
+| Новая модель `MACAddress` вместо поля `mac_address` на интерфейсе (4.2) | Да, уже обработано | `Interface.mac_address` стал read-only property (зеркалит `primary_mac_address`) начиная с NetBox 4.2. netbox-sync уже вырезает `mac_address` из payload интерфейса и передаёт его через отдельный `NBMACAddress`-объект — см. `module/sources/common/source_base.py:270-273`, `324-361`, gate `>= version.parse("4.2.0")`. Единственный реальный баг в этой части — п. 2.1 выше, он исправлен |
+
+**Вывод:** после переноса фиксов из раздела 1–2 у меня нет оснований полагать,
+что апгрейд NetBox 4.2.6 → 4.6.4 сам по себе что-то сломает в netbox-sync
+дополнительно к уже найденному. Собственно baseline-риск апгрейда (Python 3.12,
+диск, PostgreSQL/Redis) уже описан в `00_ВЫВОДЫ_И_РЕКОМЕНДАЦИИ.md` из прошлого
+чата и этим документом не отменяется.
+
+**Важная оговорка:** это статический анализ кода, не прогон против реального
+NetBox 4.6 инстанса. Обязательно протестировать на тестовом стенде перед продом
+(шаги — в `DEPLOY_RU.md`).
+
+---
+
+## 4. Источники
+
+- Issue о сворачивании поддержки: https://github.com/bb-Ricardo/netbox-sync/issues/474
+- Релиз v1.8.1: https://github.com/bb-Ricardo/netbox-sync/releases/tag/v1.8.1
+- Релиз v1.8.0: https://github.com/bb-Ricardo/netbox-sync/releases/tag/v1.8.0
+- Issue #488 (aiodns/Python 3.12): https://github.com/bb-Ricardo/netbox-sync/issues/488
+- Issue #446 (Missing API-Version): https://github.com/bb-Ricardo/netbox-sync/issues/446
+- PR #490 (skip prune on source failure): https://github.com/bb-Ricardo/netbox-sync/pull/490
+- NetBox issue #18768 (false-positive primary MAC unassign): https://github.com/netbox-community/netbox/issues/18768
+- NetBox PR #18784 (фикс #18768): https://github.com/netbox-community/netbox/pull/18784
+- Форк Sol1 (NetBox partner, предлагали maintainer-ство в #474): https://github.com/sol1/netbox-sync

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#  Copyright (c) 2020 - 2026 Ricardo Bartels. All rights reserved.
+#  Copyright (c) 2020 - 2025 Ricardo Bartels. All rights reserved.
 #
 #  netbox-sync.py
 #
@@ -87,17 +87,20 @@ def main():
     log.info("Initializing sources")
     sources = instantiate_sources()
 
+    # all sources are unavailable
+    if len(sources) == 0:
+        log.error("No working sources found. Exit.")
+        exit(1)
+
     # disable pruning if an enabled source is unavailable
+    # (ported from upstream v1.8.1, fixes bb-Ricardo/netbox-sync#490 -- without this,
+    # a transient vCenter outage causes netbox-sync to prune/delete all objects
+    # normally provided by that source, since they look "gone" during the run)
     if nb_handler.settings.prune_enabled is True:
         for source in inventory.source_list:
             if getattr(source.settings, "enabled", False) is True and source.init_successful is False:
                 nb_handler.settings.prune_enabled = False
                 log.warning(f"disabling pruning as source '{source.name}' is unavailable")
-
-    # all sources are unavailable
-    if len(sources) == 0:
-        log.error("No working sources found. Exit.")
-        exit(1)
 
     # collect all dependent object classes
     log.info("Querying necessary objects from NetBox. This might take a while.")

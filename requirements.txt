@@ -1,3 +1,6 @@
+# Versions synced from upstream bb-Ricardo/netbox-sync v1.8.1 (2026-03-18).
+# aiodns 4.0.0 fixes TypeError: Channel.gethostbyaddr() under Python 3.12
+# (needed for NetBox 4.5+ / Ubuntu 24.04) -- see upstream issue #488.
 aiodns==4.0.0
 certifi==2026.1.4
 cffi==2.0.0

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#  Copyright (c) 2020 - 2026 Ricardo Bartels. All rights reserved.
+#  Copyright (c) 2020 - 2025 Ricardo Bartels. All rights reserved.
 #
 #  netbox-sync.py
 #
@@ -1388,9 +1388,8 @@ class VMWareHandler(SourceBase):
         }
 
         if version.parse(self.inventory.netbox_api_version) >= version.parse("4.2.0"):
-            if site_name is not None:
-                data["scope_id"] = {"name": site_name}
-                data["scope_type"] = "dcim.site"
+            data["scope_id"] = {"name": site_name}
+            data["scope_type"] = "dcim.site"
         else:
             data["site"] = {"name": site_name}
 
@@ -1660,12 +1659,23 @@ class VMWareHandler(SourceBase):
 
         if self.settings.collect_hardware_asset_tag is True and "AssetTag" in identifier_dict.keys():
 
+            # FORK FIX (Lense): extended with common AMI/SMBIOS firmware default
+            # strings. "Base Board Asset Tag" and "Chassis Asset Tag" are the
+            # SMBIOS Type 2 / Type 3 defaults left by AMI/Supermicro firmware when
+            # no asset tag was ever set in BIOS. Multiple otherwise-unrelated ESXi
+            # hosts report the exact same literal string, and NetBox enforces a
+            # global-unique asset_tag -- causing "device with this asset tag
+            # already exists" on every host after the first (seen repeatedly in
+            # netbox-sync-logs). None of the original banned_tags entries matched
+            # this specific placeholder.
             banned_tags = ["Default string", "NA", "N/A", "None", "Null", "oem", "o.e.m",
-                           "to be filled by o.e.m.", "Unknown"]
+                           "to be filled by o.e.m.", "Unknown",
+                           "Base Board Asset Tag", "Chassis Asset Tag", "Asset Tag",
+                           "Not Specified", "Not Set", "Fill By OEM"]
 
-            this_asset_tag = identifier_dict.get("AssetTag")
+            this_asset_tag = str(identifier_dict.get("AssetTag") or "").strip()
 
-            if this_asset_tag.lower() not in [x.lower() for x in banned_tags]:
+            if len(this_asset_tag) > 0 and this_asset_tag.lower() not in [x.lower() for x in banned_tags]:
                 asset_tag = this_asset_tag
 
         # get host_tenant_relation
@@ -2181,35 +2191,12 @@ class VMWareHandler(SourceBase):
         platform = get_string_or_none(grab(obj, "guest.guestFullName", fallback=platform))
 
         # extract prettyName from extraConfig exposed by guest tools
-        extra_config = {x.key: x.value for x in grab(obj, "config.extraConfig", fallback=[])
-                        if x.key in ["guestOS.detailed.data", "guestInfo.detailed.data"]}
-
-        # first try 'guestInfo.detailed.data' and then 'guestOS.detailed.data'
-        detailed_data = extra_config.get("guestInfo.detailed.data") or extra_config.get("guestOS.detailed.data")
-
-        # if guestOS tools ar installed but are not able to determine the os-release
-        # then check against this pattern to guess if a correct os string has been returned
-        invalid_patterns = ["Usage:", "Error:", "command not found", "No such file"]
-
-        if isinstance(detailed_data, str):
-            detailed_data_dict = dict()
-            pretty_name = None
-            for detailed_data_item in quoted_split(detailed_data.replace("' ", "', ")):
-                if "=" not in detailed_data_item:
-                    continue
-
-                detailed_data_key, detailed_data_value = detailed_data_item.split("=")
-                detailed_data_dict[detailed_data_key] = detailed_data_value.strip("'")
-            if len(detailed_data_dict.get("prettyName", "")) > 0:
-                pretty_name = detailed_data_dict.get("prettyName")
-
-            if pretty_name and not any(pretty_name.startswith(p) for p in invalid_patterns):
-                platform = pretty_name
-                distro_version = detailed_data_dict.get("distroVersion")
-                if detailed_data_dict.get("familyName", "").lower() == "linux" and \
-                        distro_version is not None and \
-                        distro_version not in platform:
-                    platform = f'{platform} {distro_version}'
+        extra_config = [x.value for x in grab(obj, "config.extraConfig", fallback=[])
+                        if x.key == "guestOS.detailed.data"]
+        if len(extra_config) > 0:
+            pretty_name = [x for x in quoted_split(extra_config[0].replace("' ", "', ")) if x.startswith("prettyName")]
+            if len(pretty_name) > 0:
+                platform = pretty_name[0].replace("prettyName='","")
 
         if platform is not None:
             platform = self.get_object_relation(platform, "vm_platform_relation", fallback=platform)

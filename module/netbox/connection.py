@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#  Copyright (c) 2020 - 2026 Ricardo Bartels. All rights reserved.
+#  Copyright (c) 2020 - 2025 Ricardo Bartels. All rights reserved.
 #
 #  netbox-sync.py
 #
@@ -35,6 +35,20 @@ except ImportError:
     exit(1)
 
 
+class _CableRef:
+    """
+    FORK ADDITION (Lense): minimal stand-in so NetBoxHandler.request() can
+    target /api/dcim/cables/ for the cable self-heal in update_object().
+    Deliberately NOT a NetBoxObject subclass -- it must never show up in
+    NetBoxObject.__subclasses__(), which drives every query/update/prune loop
+    in this program. netbox-sync does not and should not manage cables as a
+    first-class synced object type.
+    """
+    api_path = "dcim/cables"
+    name = "cable"
+    primary_key = "id"
+
+
 class NetBoxHandler:
     """
     This class handles all connections to NetBox
@@ -57,6 +71,12 @@ class NetBoxHandler:
 
     # keep track of already resolved dependencies
     resolved_dependencies = set()
+
+    # FORK ADDITION (Lense): holds the parsed JSON error body of the last
+    # failed (4xx) request, so callers of request() can inspect *why* it failed
+    # without having to duplicate the HTTP handling. Used by the cable/virtual
+    # interface self-heal in update_object().
+    last_error_body = None
 
     def __init__(self):
 
@@ -191,6 +211,13 @@ class NetBoxHandler:
         """
         Perform a basic GET request to extract NetBox API version from header
 
+        Ported from upstream v1.8.1 (fixes bb-Ricardo/netbox-sync#446 "Missing
+        API-Version"): some NetBox setups (reverse proxies stripping custom
+        headers, newer NetBox releases) don't reliably return the 'API-Version'
+        HTTP header. NetBox's own /api/status/ endpoint always returns
+        'netbox-version' in the JSON body, so that is tried first and the
+        header is kept only as a fallback.
+
         Returns
         -------
         str: NetBox API version
@@ -321,6 +348,7 @@ class NetBoxHandler:
 
             log.error(f"NetBox returned: {this_request.method} {this_request.path_url} {response.reason}")
             log.error(f"NetBox returned body: {result}")
+            self.last_error_body = result
             result = None
 
         elif response.status_code >= 500:
@@ -597,6 +625,72 @@ class NetBoxHandler:
                            "DO NOT change this tag, otherwise syncing can't keep track of deleted objects."
         })
 
+    def _retry_after_removing_conflicting_cable(self, nb_object_sub_class, nb_id, data_to_patch):
+        """
+        FORK ADDITION (Lense). See call site in update_object().
+
+        netbox-sync never reads or writes the 'cable' field on interfaces, so
+        this error only occurs when NetBox already holds a cable termination
+        on an interface that should be a non-connectable type (observed for
+        ESXi vmkernel interfaces synced as 'virtual', 76x/run in production
+        logs -- error body: {'type': ['Virtual interfaces cannot have a cable
+        attached.']}). This is stale/incorrect NetBox data, most likely from
+        before this interface was correctly classified. We fetch the
+        interface's current cable, remove it via the API, and retry the
+        original PATCH exactly once. Any failure here is logged as a warning
+        and control returns to the normal error handling in update_object().
+
+        Parameters
+        ----------
+        nb_object_sub_class: NetBoxObject subclass
+            class definition of the object that failed to update (NBInterface)
+        nb_id: int
+            NetBox ID of the object that failed to update
+        data_to_patch: dict
+            the original data that was sent and rejected
+
+        Returns
+        -------
+        dict, None: result of the retried request, or None if no self-heal was
+                    attempted, or it also failed
+        """
+
+        error_body = self.last_error_body
+        type_errors = grab(error_body, "type") if isinstance(error_body, dict) else None
+
+        if not isinstance(type_errors, list) or \
+                not any("cannot have a cable attached" in str(e).lower() for e in type_errors):
+            return None
+
+        log.warning(f"{nb_object_sub_class.name} id {nb_id} has an existing NetBox cable that "
+                    f"conflicts with its synced type. Attempting to remove the stale cable "
+                    f"and retry once.")
+
+        try:
+            current = self.request(nb_object_sub_class, req_type="GET", nb_id=nb_id)
+            cable_id = grab(current, "cable.id")
+
+            if cable_id is None:
+                log.warning(f"Could not determine the conflicting cable ID for "
+                            f"{nb_object_sub_class.name} id {nb_id}. Please check this "
+                            f"interface manually in NetBox.")
+                return None
+
+            if self.request(_CableRef, req_type="DELETE", nb_id=cable_id) is not True:
+                log.warning(f"Failed to remove cable id {cable_id} from "
+                            f"{nb_object_sub_class.name} id {nb_id}.")
+                return None
+
+            log.info(f"Removed stale cable id {cable_id} from {nb_object_sub_class.name} "
+                     f"id {nb_id}, retrying update.")
+
+            return self.request(nb_object_sub_class, req_type="PATCH", data=data_to_patch, nb_id=nb_id)
+
+        except Exception as e:
+            log.warning(f"Self-heal for {nb_object_sub_class.name} id {nb_id} cable "
+                        f"conflict failed: {e}")
+            return None
+
     def update_object(self, nb_object_sub_class, unset=False, last_run=False):
         """
         Iterate over all objects of a certain NetBoxObject subclass and add/update them.
@@ -702,6 +796,22 @@ class NetBoxHandler:
                                                     data=data_to_patch, nb_id=nb_id)
 
                 issued_request = True
+
+                # FORK ADDITION (Lense): self-heal 'Virtual interfaces cannot
+                # have a cable attached' conflicts.
+                # netbox-sync never tracks/patches the 'cable' field itself, so this
+                # only happens when NetBox already has a cable termination on an
+                # interface that netbox-sync (correctly) wants to keep/set as a
+                # non-connectable type (e.g. ESXi vmkernel ports synced as
+                # 'virtual'). This is normally leftover/incorrect data in NetBox
+                # (manually cabled, or from a run predating this fix). We detect
+                # the specific error, remove the stale cable via the API, and
+                # retry the original PATCH exactly once. If anything about this
+                # goes wrong we fall back to the normal error logging below.
+                if returned_object_data is None and req_type == "PATCH" \
+                        and nb_object_sub_class is NBInterface:
+                    returned_object_data = self._retry_after_removing_conflicting_cable(
+                        nb_object_sub_class, nb_id, data_to_patch)
 
             if returned_object_data is not None:
 

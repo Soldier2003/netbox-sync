@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-#  Copyright (c) 2020 - 2026 Ricardo Bartels. All rights reserved.
+#  Copyright (c) 2020 - 2025 Ricardo Bartels. All rights reserved.
 #
 #  netbox-sync.py
 #
@@ -683,29 +683,6 @@ class NetBoxObject:
             if self.data_model.get(key) == NBCustomField:
                 if current_value is None:
                     current_value = dict()
-
-                # Fix for object/multi-object custom fields
-                # When patching, we only need the IDs, not the full object representation
-                new_value_copy = new_value.copy()
-                for field_name, field_value in new_value_copy.items():
-                    # Check for custom field type
-                    custom_field = self.inventory.get_by_data(NBCustomField, data={"name": field_name})
-                    if custom_field is not None:
-                        field_type = grab(custom_field, "data.type")
-
-                        # Handle object type custom fields - need only ID
-                        if field_type == "object" and isinstance(field_value, dict) and field_value.get('id') is not None:
-                            new_value[field_name] = field_value.get('id')
-
-                        # Handle multi-object type custom fields - need list of IDs
-                        elif field_type == "multi-object" and isinstance(field_value, list):
-                            ids = []
-                            for item in field_value:
-                                if isinstance(item, dict) and item.get('id') is not None:
-                                    ids.append(item.get('id'))
-                            if ids:
-                                new_value[field_name] = ids
-
                 new_value = {**current_value, **new_value}
                 new_value_str = str(new_value)
             elif isinstance(new_value, (NetBoxObject, NBObjectList)):
@@ -1311,7 +1288,7 @@ class NBCustomField(NetBoxObject):
             "object_types": list,
             # field name (object_types) for NetBox < 4.0.0
             "content_types": list,
-            "type": ["text", "longtext", "integer", "boolean", "date", "url", "json", "select", "multiselect", "object", "multi-object"],
+            "type": ["text", "longtext", "integer", "boolean", "date", "url", "json", "select", "multiselect"],
             "name": 50,
             "label": 50,
             "description": 200,
@@ -2325,10 +2302,21 @@ class NBMACAddress(NetBoxObject):
     def remove_interface_association(self):
         o_id = self.data.get("assigned_object_id")
         o_type = self.data.get("assigned_object_type")
-        o_device = self.get_device_vm()
+        o_interface = self.get_interface()
 
-        if grab(o_device, "data.primary_mac_address") is self:
-            o_device.unset_attribute("primary_mac_address")
+        # FORK FIX (Lense): 'primary_mac_address' lives on the interface
+        # (NBInterface/NBVMInterface), not on the parent device/VM -- unlike
+        # 'primary_ip4'/'primary_ip6' which genuinely are device/VM-level fields.
+        # The upstream code checked grab(o_device, "data.primary_mac_address"),
+        # which is never present on NBDevice/NBVM (see their data_model), so this
+        # branch never fired. As a result the interface kept referencing this MAC
+        # as primary, and NetBox rejected the subsequent unassign with
+        # "Cannot unassign MAC Address while it is designated as the primary MAC
+        # for an object" (seen repeatedly in netbox-sync-logs, ~76x per run).
+        # See also netbox-community/netbox#18768 for a related (separate,
+        # since-fixed) false-positive bug in NetBox's own validation.
+        if grab(o_interface, "data.primary_mac_address") is self:
+            o_interface.unset_attribute("primary_mac_address")
 
         if o_id is not None:
             self.unset_attribute("assigned_object_id")
