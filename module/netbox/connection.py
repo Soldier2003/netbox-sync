@@ -11,6 +11,7 @@ import json
 import os
 import pickle
 import pprint
+import time
 from datetime import datetime
 from http.client import HTTPConnection
 
@@ -320,6 +321,17 @@ class NetBoxHandler:
                     log.debug2("NetBox results are paginated. Getting next page")
 
                     response = self.single_request(this_request)
+
+                    # FORK FIX (Lense): the original code called response.json() here
+                    # unconditionally. If NetBox (or a reverse proxy in front of it)
+                    # returns a transient 5xx on a page *after* the first one -- even
+                    # after single_request()'s own retries are exhausted -- the body
+                    # is not JSON and this used to crash the whole run with an
+                    # unhandled JSONDecodeError traceback instead of a clean error.
+                    if response.status_code != 200:
+                        do_error_exit(f"NetBox returned: {response.status_code} {response.reason} "
+                                       f"while fetching a paginated page of {object_class.name} objects.")
+
                     result["results"].extend(response.json().get("results"))
 
         elif response.status_code in [201, 204]:
@@ -377,7 +389,7 @@ class NetBoxHandler:
         if log.level == DEBUG3:
             pprint.pprint(vars(this_request))
 
-        for _ in range(self.settings.max_retry_attempts):
+        for attempt in range(self.settings.max_retry_attempts):
 
             log_message = f"Sending {this_request.method} to '{this_request.url}'"
 
@@ -395,6 +407,18 @@ class NetBoxHandler:
                 log.warning(f"Request failed, trying again: {log_message}")
                 continue
             else:
+                # FORK ADDITION (Lense): a completed response with a 5xx status is a
+                # transient failure of NetBox itself (or a reverse proxy in front of
+                # it, e.g. a 502 during a brief gunicorn worker restart) -- retry it
+                # the same way a connection-level failure is retried, instead of
+                # treating it as a final answer. Only the *last* attempt's 5xx
+                # response is allowed through, so callers can still detect and
+                # report it if the problem isn't transient.
+                if response.status_code >= 500 and attempt < self.settings.max_retry_attempts - 1:
+                    log.warning(f"NetBox returned {response.status_code} {response.reason}, "
+                                f"trying again: {log_message}")
+                    time.sleep(2)
+                    continue
                 break
         else:
             do_error_exit(f"Giving up after {self.settings.max_retry_attempts} retries.")
