@@ -715,6 +715,57 @@ class NetBoxHandler:
                         f"conflict failed: {e}")
             return None
 
+    def _retry_after_clearing_conflicting_tagged_vlans(self, nb_object_sub_class, nb_id, data_to_patch):
+        """
+        FORK ADDITION (Lense). See call site in update_object().
+
+        When an interface's mode changes to 'tagged-all' (or another mode that
+        does not carry an explicit VLAN list), the vmware source simply omits
+        the 'tagged_vlans' key from the data it builds -- it never sends an
+        explicit empty list. If NetBox already holds a non-empty 'tagged_vlans'
+        value on that interface from a previous run (when it was e.g. mode
+        'tagged' with specific VLANs), the resulting object state is invalid
+        and NetBox rejects the PATCH with body:
+        {'tagged_vlans': ['Interface mode does not support tagged vlans']}
+        -- confirmed present already in production logs from 20.07.2026,
+        before any fork changes (esxi04 vmnic2/vmnic3, interface id 4581/4582).
+        We add an explicit 'tagged_vlans': [] to the same PATCH and retry once.
+
+        Parameters
+        ----------
+        nb_object_sub_class: NetBoxObject subclass
+            class definition of the object that failed to update (NBInterface / NBVMInterface)
+        nb_id: int
+            NetBox ID of the object that failed to update
+        data_to_patch: dict
+            the original data that was sent and rejected
+
+        Returns
+        -------
+        dict, None: result of the retried request, or None if no self-heal was
+                    attempted, or it also failed
+        """
+
+        error_body = self.last_error_body
+        tagged_vlan_errors = grab(error_body, "tagged_vlans") if isinstance(error_body, dict) else None
+
+        if not isinstance(tagged_vlan_errors, list) or \
+                not any("does not support tagged vlans" in str(e).lower() for e in tagged_vlan_errors):
+            return None
+
+        log.warning(f"{nb_object_sub_class.name} id {nb_id} has a stale NetBox 'tagged_vlans' value "
+                    f"that conflicts with its new interface mode. Clearing it and retrying once.")
+
+        retry_data = dict(data_to_patch)
+        retry_data["tagged_vlans"] = []
+
+        try:
+            return self.request(nb_object_sub_class, req_type="PATCH", data=retry_data, nb_id=nb_id)
+        except Exception as e:
+            log.warning(f"Self-heal for {nb_object_sub_class.name} id {nb_id} tagged_vlans "
+                        f"conflict failed: {e}")
+            return None
+
     def update_object(self, nb_object_sub_class, unset=False, last_run=False):
         """
         Iterate over all objects of a certain NetBoxObject subclass and add/update them.
@@ -835,6 +886,15 @@ class NetBoxHandler:
                 if returned_object_data is None and req_type == "PATCH" \
                         and nb_object_sub_class is NBInterface:
                     returned_object_data = self._retry_after_removing_conflicting_cable(
+                        nb_object_sub_class, nb_id, data_to_patch)
+
+                # FORK ADDITION (Lense): self-heal stale 'tagged_vlans' left over from a
+                # previous run, conflicting with a newly-synced interface mode (e.g.
+                # 'tagged-all'). Applies to both host interfaces and VM interfaces --
+                # both carry 'tagged_vlans' and can transition mode the same way.
+                if returned_object_data is None and req_type == "PATCH" \
+                        and nb_object_sub_class in (NBInterface, NBVMInterface):
+                    returned_object_data = self._retry_after_clearing_conflicting_tagged_vlans(
                         nb_object_sub_class, nb_id, data_to_patch)
 
             if returned_object_data is not None:
