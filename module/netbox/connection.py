@@ -339,9 +339,23 @@ class NetBoxHandler:
             action = "created" if response.status_code == 201 else "deleted"
 
             if req_type == "DELETE":
-                object_name = self.inventory.get_by_id(object_class, nb_id)
-                if object_name is not None:
-                    object_name = object_name.get_display_name()
+                # FORK FIX (Lense): inventory.get_by_id() raises AttributeError for any
+                # object_class that isn't a real NetBoxObject subclass (by design --
+                # it's meant to look up *synced* objects). Helper classes like
+                # _CableRef are deliberately not NetBoxObject subclasses (see its
+                # docstring), so calling get_by_id() for them here used to blow up
+                # with "'_CableRef' object must be a subclass of 'NetBoxObject'." --
+                # caught by the self-heal's own try/except, which masked a *real*
+                # successful DELETE (NetBox already returned 204) as a self-heal
+                # failure and skipped the PATCH retry. Only look up the friendly
+                # display name for genuine NetBoxObject subclasses.
+                object_name = None
+                if object_class in NetBoxObject.__subclasses__():
+                    object_name = self.inventory.get_by_id(object_class, nb_id)
+                    if object_name is not None:
+                        object_name = object_name.get_display_name()
+                if object_name is None:
+                    object_name = nb_id
             else:
                 object_name = result.get(object_class.primary_key)
 
